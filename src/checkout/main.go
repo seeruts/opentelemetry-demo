@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -602,14 +603,26 @@ func (cs *checkout) sendToPostProcessor(ctx context.Context, result *pb.OrderRes
 
 	ffValue := cs.getIntFeatureFlag(ctx, "kafkaQueueProblems")
 	if ffValue > 0 {
-		log.Infof("Warning: FeatureFlag 'kafkaQueueProblems' is activated, overloading queue now.")
-		for i := 0; i < ffValue; i++ {
-			go func(i int) {
-				cs.KafkaProducerClient.Input() <- &msg
-				_ = <-cs.KafkaProducerClient.Successes()
-			}(i)
+		// Safeguard: Only allow this in non-production environments
+		environment := strings.ToLower(os.Getenv("ENVIRONMENT"))
+		if environment == "production" {
+			log.Warnf("Warning: FeatureFlag 'kafkaQueueProblems' is enabled but ignored in production environment")
+		} else {
+			// Limit the number of messages to prevent excessive overload - cap at 10 instead of potentially 100
+			cappedValue := ffValue
+			if cappedValue > 10 {
+				cappedValue = 10
+				log.Warnf("Warning: FeatureFlag 'kafkaQueueProblems' value capped from %d to %d to prevent excessive overload", ffValue, cappedValue)
+			}
+			log.Infof("Warning: FeatureFlag 'kafkaQueueProblems' is activated, overloading queue with %d messages (requested: %d).", cappedValue, ffValue)
+			for i := 0; i < cappedValue; i++ {
+				go func(i int) {
+					cs.KafkaProducerClient.Input() <- &msg
+					_ = <-cs.KafkaProducerClient.Successes()
+				}(i)
+			}
+			log.Infof("Done with #%d messages for overload simulation.", cappedValue)
 		}
-		log.Infof("Done with #%d messages for overload simulation.", ffValue)
 	}
 }
 

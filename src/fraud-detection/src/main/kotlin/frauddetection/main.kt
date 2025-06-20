@@ -57,9 +57,18 @@ fun main() {
                 .poll(ofMillis(100))
                 .fold(totalCount) { accumulator, record ->
                     val newCount = accumulator + 1
-                    if (getFeatureFlagValue("kafkaQueueProblems") > 0) {
-                        logger.info("FeatureFlag 'kafkaQueueProblems' is enabled, sleeping 1 second")
-                        Thread.sleep(1000)
+                    val kafkaQueueProblemsValue = getFeatureFlagValue("kafkaQueueProblems")
+                    if (kafkaQueueProblemsValue > 0) {
+                        // Safeguard: Only allow this in non-production environments
+                        val environment = System.getenv("ENVIRONMENT") ?: "development"
+                        if (environment.lowercase() == "production") {
+                            logger.warn("FeatureFlag 'kafkaQueueProblems' is enabled but ignored in production environment")
+                        } else {
+                            // Limit the delay to prevent excessive lag - cap at 100ms instead of 1000ms
+                            val delayMs = minOf(100, kafkaQueueProblemsValue)
+                            logger.info("FeatureFlag 'kafkaQueueProblems' is enabled, sleeping ${delayMs}ms (was requested ${kafkaQueueProblemsValue}ms)")
+                            Thread.sleep(delayMs.toLong())
+                        }
                     }
                     val orders = OrderResult.parseFrom(record.value())
                     logger.info("Consumed record with orderId: ${orders.orderId}, and updated total count to: $newCount")
