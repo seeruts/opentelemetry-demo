@@ -496,17 +496,105 @@ func (cs *checkout) sendOrderConfirmation(ctx context.Context, email string, ord
 		return fmt.Errorf("failed to marshal order to JSON: %+v", err)
 	}
 
-	resp, err := otelhttp.Post(ctx, cs.emailSvcAddr+"/send_order_confirmation", "application/json", bytes.NewBuffer(emailPayload))
-	if err != nil {
-		return fmt.Errorf("failed POST to email service: %+v", err)
-	}
-	defer resp.Body.Close()
+	return cs.sendOrderConfirmationWithRetry(ctx, emailPayload, email)
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed POST to email service: expected 200, got %d", resp.StatusCode)
+// sendOrderConfirmationWithRetry implements retry logic with exponential backoff for email service calls
+func (cs *checkout) sendOrderConfirmationWithRetry(ctx context.Context, emailPayload []byte, email string) error {
+	const maxRetries = 3
+	const baseDelay = 100 * time.Millisecond
+	
+	span := trace.SpanFromContext(ctx)
+	
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Calculate exponential backoff delay with jitter
+			delay := time.Duration(float64(baseDelay) * (1 << (attempt - 1)))
+			// Add jitter (0-50% of delay)
+			jitter := time.Duration(float64(delay) * 0.5 * (0.5 + 0.5*float64(time.Now().UnixNano()%1000)/1000))
+			delay += jitter
+			
+			log.Infof("retrying email service call for %q (attempt %d/%d) after %v", email, attempt+1, maxRetries+1, delay)
+			
+			// Check if context is still valid before sleeping
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled while retrying email service: %w", ctx.Err())
+			case <-time.After(delay):
+				// Continue with retry
+			}
+		}
+		
+		resp, err := otelhttp.Post(ctx, cs.emailSvcAddr+"/send_order_confirmation", "application/json", bytes.NewBuffer(emailPayload))
+		if err != nil {
+			if attempt == maxRetries {
+				span.SetAttributes(
+					attribute.Int("app.email.retry.final_attempt", attempt+1),
+					attribute.Bool("app.email.retry.success", false),
+				)
+				return fmt.Errorf("failed POST to email service after %d attempts: %+v", maxRetries+1, err)
+			}
+			log.Warnf("email service network error (attempt %d/%d): %+v", attempt+1, maxRetries+1, err)
+			span.AddEvent("email_retry_network_error", trace.WithAttributes(
+				attribute.Int("app.email.retry.attempt", attempt+1),
+				attribute.String("app.email.retry.error", err.Error()),
+			))
+			continue
+		}
+		
+		defer resp.Body.Close()
+		
+		if resp.StatusCode == http.StatusOK {
+			if attempt > 0 {
+				log.Infof("email service call succeeded for %q after %d attempts", email, attempt+1)
+				span.SetAttributes(
+					attribute.Int("app.email.retry.final_attempt", attempt+1),
+					attribute.Bool("app.email.retry.success", true),
+				)
+			}
+			return nil
+		}
+		
+		// Check if this is a retryable error
+		if !isRetryableHTTPStatus(resp.StatusCode) {
+			span.SetAttributes(
+				attribute.Int("app.email.retry.final_attempt", attempt+1),
+				attribute.Bool("app.email.retry.success", false),
+				attribute.Int("app.email.retry.final_status_code", resp.StatusCode),
+			)
+			return fmt.Errorf("failed POST to email service: expected 200, got %d (non-retryable)", resp.StatusCode)
+		}
+		
+		if attempt == maxRetries {
+			span.SetAttributes(
+				attribute.Int("app.email.retry.final_attempt", attempt+1),
+				attribute.Bool("app.email.retry.success", false),
+				attribute.Int("app.email.retry.final_status_code", resp.StatusCode),
+			)
+			return fmt.Errorf("failed POST to email service: expected 200, got %d (exhausted %d retries)", resp.StatusCode, maxRetries+1)
+		}
+		
+		log.Warnf("email service error %d for %q (attempt %d/%d), will retry", resp.StatusCode, email, attempt+1, maxRetries+1)
+		span.AddEvent("email_retry_http_error", trace.WithAttributes(
+			attribute.Int("app.email.retry.attempt", attempt+1),
+			attribute.Int("app.email.retry.status_code", resp.StatusCode),
+		))
 	}
+	
+	return fmt.Errorf("failed POST to email service: exhausted all retry attempts")
+}
 
-	return err
+// isRetryableHTTPStatus determines if an HTTP status code represents a retryable error
+func isRetryableHTTPStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusInternalServerError,    // 500
+		http.StatusBadGateway,             // 502
+		http.StatusServiceUnavailable,     // 503
+		http.StatusGatewayTimeout:         // 504
+		return true
+	default:
+		return false
+	}
 }
 
 func (cs *checkout) shipOrder(ctx context.Context, address *pb.Address, items []*pb.CartItem) (string, error) {
