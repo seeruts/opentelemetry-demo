@@ -55,6 +55,15 @@
       },
       "defaultVariant": "off"
     },
+    "disableKafkaQueueProblems": {
+      "description": "Master kill switch to disable kafkaQueueProblems feature flag - when enabled, overrides kafkaQueueProblems setting",
+      "state": "ENABLED",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "defaultVariant": "on"
+    },
     "cartFailure": {
       "description": "Fail cart service",
       "state": "ENABLED",

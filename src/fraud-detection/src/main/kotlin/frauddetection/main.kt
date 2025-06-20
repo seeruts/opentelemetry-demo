@@ -57,10 +57,16 @@ fun main() {
                 .poll(ofMillis(100))
                 .fold(totalCount) { accumulator, record ->
                     val newCount = accumulator + 1
-                    if (getFeatureFlagValue("kafkaQueueProblems") > 0) {
+                    
+                    // Check the kill switch first - if enabled, skip the kafkaQueueProblems behavior
+                    val isKillSwitchEnabled = getFeatureFlagValue("disableKafkaQueueProblems") > 0
+                    if (!isKillSwitchEnabled && getFeatureFlagValue("kafkaQueueProblems") > 0) {
                         logger.info("FeatureFlag 'kafkaQueueProblems' is enabled, sleeping 1 second")
                         Thread.sleep(1000)
+                    } else if (isKillSwitchEnabled) {
+                        logger.info("FeatureFlag 'disableKafkaQueueProblems' is enabled, skipping kafkaQueueProblems behavior")
                     }
+                    
                     val orders = OrderResult.parseFrom(record.value())
                     logger.info("Consumed record with orderId: ${orders.orderId}, and updated total count to: $newCount")
                     newCount

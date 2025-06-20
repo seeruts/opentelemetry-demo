@@ -600,8 +600,10 @@ func (cs *checkout) sendToPostProcessor(ctx context.Context, result *pb.OrderRes
 		return
 	}
 
+	// Check the kill switch first - if enabled, skip the kafkaQueueProblems behavior
+	isKillSwitchEnabled := cs.isFeatureFlagEnabled(ctx, "disableKafkaQueueProblems")
 	ffValue := cs.getIntFeatureFlag(ctx, "kafkaQueueProblems")
-	if ffValue > 0 {
+	if !isKillSwitchEnabled && ffValue > 0 {
 		log.Infof("Warning: FeatureFlag 'kafkaQueueProblems' is activated, overloading queue now.")
 		for i := 0; i < ffValue; i++ {
 			go func(i int) {
@@ -610,6 +612,8 @@ func (cs *checkout) sendToPostProcessor(ctx context.Context, result *pb.OrderRes
 			}(i)
 		}
 		log.Infof("Done with #%d messages for overload simulation.", ffValue)
+	} else if isKillSwitchEnabled {
+		log.Infof("FeatureFlag 'disableKafkaQueueProblems' is enabled, skipping kafkaQueueProblems behavior")
 	}
 }
 
