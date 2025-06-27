@@ -314,11 +314,18 @@ func (cs *checkout) PlaceOrder(ctx context.Context, req *pb.PlaceOrderRequest) (
 		shippingTrackingAttribute,
 	)
 
-	if err := cs.sendOrderConfirmation(ctx, req.Email, orderResult); err != nil {
-		log.Warnf("failed to send order confirmation to %q: %+v", req.Email, err)
-	} else {
-		log.Infof("order confirmation email sent to %q", req.Email)
-	}
+	// Send order confirmation email asynchronously to avoid blocking order completion
+	go func() {
+		emailCtx, emailCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer emailCancel()
+		
+		if err := cs.sendOrderConfirmation(emailCtx, req.Email, orderResult); err != nil {
+			log.Warnf("failed to send order confirmation to %q: %+v", req.Email, err)
+			// TODO: Consider adding to a retry queue or dead letter queue for critical emails
+		} else {
+			log.Infof("order confirmation email sent to %q", req.Email)
+		}
+	}()
 
 	// send to kafka only if kafka broker address is set
 	if cs.kafkaBrokerSvcAddr != "" {
@@ -488,25 +495,144 @@ func (cs *checkout) chargeCard(ctx context.Context, amount *pb.Money, paymentInf
 }
 
 func (cs *checkout) sendOrderConfirmation(ctx context.Context, email string, order *pb.OrderResult) error {
+	const maxRetries = 3
+	const baseDelay = 100 * time.Millisecond
+	
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := cs.sendOrderConfirmationAttempt(ctx, email, order)
+		if err == nil {
+			return nil
+		}
+		
+		log.Warnf("attempt %d/%d to send order confirmation failed: %v", attempt, maxRetries, err)
+		
+		// Don't retry on client errors (4xx)
+		if isClientError(err) {
+			return err
+		}
+		
+		// If this is the last attempt, return the error
+		if attempt == maxRetries {
+			return err
+		}
+		
+		// Exponential backoff with jitter
+		delay := time.Duration(attempt) * baseDelay
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+			// Continue to next attempt
+		}
+	}
+	
+	return fmt.Errorf("failed to send order confirmation after %d attempts", maxRetries)
+}
+
+func (cs *checkout) sendOrderConfirmationAttempt(ctx context.Context, email string, order *pb.OrderResult) error {
+	ctx, span := tracer.Start(ctx, "sendOrderConfirmation")
+	defer span.End()
+	
+	span.SetAttributes(
+		attribute.String("app.email.recipient", email),
+		attribute.String("app.order.id", order.OrderId),
+	)
+	
+	// Validate inputs
+	if email == "" {
+		span.SetStatus(otelcodes.Error, "email is required")
+		return fmt.Errorf("email is required")
+	}
+	if order == nil {
+		span.SetStatus(otelcodes.Error, "order is required")
+		return fmt.Errorf("order is required")
+	}
+	
 	emailPayload, err := json.Marshal(map[string]interface{}{
 		"email": email,
 		"order": order,
 	})
 	if err != nil {
+		span.SetStatus(otelcodes.Error, "failed to marshal order to JSON")
 		return fmt.Errorf("failed to marshal order to JSON: %+v", err)
 	}
 
-	resp, err := otelhttp.Post(ctx, cs.emailSvcAddr+"/send_order_confirmation", "application/json", bytes.NewBuffer(emailPayload))
+	// Add timeout for individual request
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	
+	resp, err := otelhttp.Post(reqCtx, cs.emailSvcAddr+"/send_order_confirmation", "application/json", bytes.NewBuffer(emailPayload))
 	if err != nil {
+		span.SetStatus(otelcodes.Error, "failed POST to email service")
 		return fmt.Errorf("failed POST to email service: %+v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed POST to email service: expected 200, got %d", resp.StatusCode)
+	// Read response body for better error information
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		log.Warnf("failed to read email service response body: %v", readErr)
+		respBody = []byte{}
 	}
+	
+	span.SetAttributes(
+		attribute.Int("http.status_code", resp.StatusCode),
+		attribute.String("http.response_body", string(respBody)),
+	)
 
-	return err
+	if resp.StatusCode == http.StatusOK {
+		span.SetStatus(otelcodes.Ok, "email sent successfully")
+		return nil
+	}
+	
+	// Categorize errors for better handling
+	var errorMsg string
+	if len(respBody) > 0 {
+		// Try to parse error response
+		var errorResp struct {
+			Error   string `json:"error"`
+			Details string `json:"details"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(respBody, &errorResp) == nil {
+			if errorResp.Error != "" {
+				errorMsg = errorResp.Error
+				if errorResp.Details != "" {
+					errorMsg += ": " + errorResp.Details
+				}
+			} else if errorResp.Message != "" {
+				errorMsg = errorResp.Message
+			}
+		}
+	}
+	
+	if errorMsg == "" {
+		errorMsg = fmt.Sprintf("HTTP %d", resp.StatusCode)
+	}
+	
+	span.SetStatus(otelcodes.Error, errorMsg)
+	return &EmailServiceError{
+		StatusCode: resp.StatusCode,
+		Message:    errorMsg,
+	}
+}
+
+// EmailServiceError represents an error from the email service
+type EmailServiceError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *EmailServiceError) Error() string {
+	return fmt.Sprintf("email service error (HTTP %d): %s", e.StatusCode, e.Message)
+}
+
+// isClientError returns true if the error is a client error (4xx)
+func isClientError(err error) bool {
+	if emailErr, ok := err.(*EmailServiceError); ok {
+		return emailErr.StatusCode >= 400 && emailErr.StatusCode < 500
+	}
+	return false
 }
 
 func (cs *checkout) shipOrder(ctx context.Context, address *pb.Address, items []*pb.CartItem) (string, error) {
